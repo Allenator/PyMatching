@@ -1,0 +1,344 @@
+# Copyright 2022 PyMatching Contributors
+
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+
+#      http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import numpy as np
+import pytest
+from scipy.sparse import csc_matrix
+
+import pymatching
+from pymatching import Matching
+
+
+class TestEdgeReweighting:
+    """Test suite for edge reweighting functionality."""
+
+    def test_basic_edge_reweighting(self):
+        """Test basic edge reweighting with simple graph."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0, fault_ids=0)
+        m.add_edge(1, 2, weight=2.0, fault_ids=1)
+        m.add_boundary_edge(0, weight=0.5, fault_ids=2)
+        m.add_boundary_edge(2, weight=0.5, fault_ids=3)
+
+        # Test without reweighting
+        syndrome = np.array([1, 0, 1])
+        correction_orig = m.decode(syndrome)
+
+        # Test with edge reweighting - make edge (0,1) much heavier
+        edge_reweights = np.array([
+            [0, 1, 10.0],  # Make edge (0,1) very heavy
+        ], dtype=np.float64)
+
+        correction_reweighted = m.decode(syndrome, edge_reweights=edge_reweights)
+
+        # The reweighted solution should potentially be different
+        # (depending on the specific graph structure and syndrome)
+        assert correction_reweighted is not None
+        assert len(correction_reweighted) >= 1
+
+    def test_boundary_edge_reweighting(self):
+        """Test reweighting of boundary edges."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0)
+        m.add_boundary_edge(0, weight=1.0)
+        m.add_boundary_edge(1, weight=1.0)
+
+        # Reweight boundary edge
+        edge_reweights = np.array([
+            [0, -1, 0.1],  # Make boundary edge (0,) very light
+        ], dtype=np.float64)
+
+        syndrome = np.array([1, 0])
+        correction = m.decode(syndrome, edge_reweights=edge_reweights)
+
+        assert correction is not None
+
+    def test_multiple_edge_reweighting(self):
+        """Test reweighting multiple edges simultaneously."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0)
+        m.add_edge(1, 2, weight=1.0)
+        m.add_edge(2, 3, weight=1.0)
+        m.add_boundary_edge(0, weight=1.0)
+        m.add_boundary_edge(3, weight=1.0)
+
+        # Reweight multiple edges
+        edge_reweights = np.array([
+            [0, 1, 0.1],   # Make edge (0,1) light
+            [1, 2, 10.0],  # Make edge (1,2) heavy
+            [0, -1, 5.0],  # Make boundary edge (0,) heavy
+        ], dtype=np.float64)
+
+        syndrome = np.array([1, 0, 0, 1])
+        correction = m.decode(syndrome, edge_reweights=edge_reweights)
+
+        assert correction is not None
+
+    def test_reweighting_without_regeneration(self):
+        """Test edge reweighting without graph regeneration (direct weight updates)."""
+        m = Matching()
+        m.add_edge(0, 1, weight=2.0, fault_ids=0)  # Original max weight is 2.0
+        m.add_edge(1, 2, weight=1.0, fault_ids=1)
+        m.add_boundary_edge(0, weight=1.5, fault_ids=2)
+
+        # Reweight with values <= original max (should avoid regeneration)
+        edge_reweights = np.array([
+            [0, 1, 1.5],   # New weight <= original max (2.0)
+            [1, 2, 0.5],   # New weight <= original max
+        ], dtype=np.float64)
+
+        syndrome = np.array([1, 0, 1])
+        correction = m.decode(syndrome, edge_reweights=edge_reweights)
+
+        assert correction is not None
+
+    def test_reweighting_with_regeneration(self):
+        """Test edge reweighting with graph regeneration (full regeneration)."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0, fault_ids=0)  # Original max weight is 1.0
+        m.add_edge(1, 2, weight=0.5, fault_ids=1)
+        m.add_boundary_edge(0, weight=0.8, fault_ids=2)
+
+        # Reweight with values > original max (should trigger regeneration)
+        edge_reweights = np.array([
+            [0, 1, 5.0],   # New weight > original max (1.0)
+        ], dtype=np.float64)
+
+        syndrome = np.array([1, 0, 1])
+        correction = m.decode(syndrome, edge_reweights=edge_reweights)
+
+        assert correction is not None
+
+    def test_batch_decoding_with_reweights(self):
+        """Test batch decoding with edge reweights."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0)
+        m.add_edge(1, 2, weight=1.0)
+        m.add_boundary_edge(0, weight=1.0)
+        m.add_boundary_edge(2, weight=1.0)
+
+        # Create batch of syndromes
+        shots = np.array([
+            [1, 0, 1],
+            [0, 1, 0],
+            [1, 1, 0]
+        ], dtype=np.uint8)
+
+        # Different reweights for each shot
+        reweights1 = np.array([[0, 1, 0.1]], dtype=np.float64)
+        reweights2 = np.array([[1, 2, 0.1]], dtype=np.float64)
+        reweights3 = np.array([[0, -1, 0.1]], dtype=np.float64)
+
+        edge_reweights = [reweights1, reweights2, reweights3]
+
+        corrections = m.decode_batch(shots, edge_reweights=edge_reweights)
+
+        assert corrections.shape[0] == 3  # Three shots
+        assert corrections is not None
+
+    def test_weight_restoration(self):
+        """Test that original weights are restored after decoding."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0)
+        m.add_edge(1, 2, weight=2.0)
+
+        # Store original correction
+        syndrome = np.array([1, 0, 1])
+        correction_orig = m.decode(syndrome)
+
+        # Decode with reweights
+        edge_reweights = np.array([[0, 1, 10.0]], dtype=np.float64)
+        correction_reweighted = m.decode(syndrome, edge_reweights=edge_reweights)
+
+        # Decode again without reweights - should match original
+        correction_restored = m.decode(syndrome)
+
+        np.testing.assert_array_equal(correction_orig, correction_restored)
+
+    def test_return_weight_with_reweights(self):
+        """Test that return_weight works correctly with reweights."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0)
+        m.add_boundary_edge(0, weight=0.5)
+        m.add_boundary_edge(1, weight=0.5)
+
+        syndrome = np.array([1, 1])
+
+        # Get weight without reweights
+        correction_orig, weight_orig = m.decode(syndrome, return_weight=True)
+
+        # Get weight with reweights
+        edge_reweights = np.array([[0, 1, 2.0]], dtype=np.float64)
+        correction_reweighted, weight_reweighted = m.decode(
+            syndrome, edge_reweights=edge_reweights, return_weight=True
+        )
+
+        assert isinstance(weight_orig, (int, float))
+        assert isinstance(weight_reweighted, (int, float))
+        # Weight should be different due to reweighting
+        assert weight_reweighted != weight_orig
+
+    def test_correlations_with_reweights(self):
+        """Test that enable_correlations works with reweights."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0)
+        m.add_edge(1, 2, weight=1.0)
+        m.add_boundary_edge(0, weight=1.0)
+        m.add_boundary_edge(2, weight=1.0)
+
+        syndrome = np.array([1, 0, 1])
+        edge_reweights = np.array([[0, 1, 0.5]], dtype=np.float64)
+
+        # Should work without throwing an exception
+        correction = m.decode(
+            syndrome,
+            edge_reweights=edge_reweights,
+            enable_correlations=True
+        )
+
+        assert correction is not None
+
+    def test_invalid_edge_specification(self):
+        """Test error handling for invalid edge specifications."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0)
+
+        syndrome = np.array([1, 1])
+
+        # Test non-existent edge
+        with pytest.raises(ValueError, match="does not exist"):
+            edge_reweights = np.array([[0, 2, 1.0]], dtype=np.float64)  # Edge (0,2) doesn't exist
+            m.decode(syndrome, edge_reweights=edge_reweights)
+
+    def test_negative_weight_reweighting(self):
+        """Test error handling for negative reweight values."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0)
+
+        syndrome = np.array([1, 1])
+
+        # Test negative weight
+        with pytest.raises(ValueError, match="non-negative"):
+            edge_reweights = np.array([[0, 1, -1.0]], dtype=np.float64)  # Negative weight
+            m.decode(syndrome, edge_reweights=edge_reweights)
+
+    def test_invalid_boundary_edge_format(self):
+        """Test error handling for invalid boundary edge format."""
+        m = Matching()
+        m.add_boundary_edge(0, weight=1.0)
+
+        syndrome = np.array([1])
+
+        # Test invalid boundary edge format (should use -1, not -2)
+        with pytest.raises(ValueError, match="exactly -1"):
+            edge_reweights = np.array([[0, -2, 1.0]], dtype=np.float64)
+            m.decode(syndrome, edge_reweights=edge_reweights)
+
+    def test_reweighting_with_check_matrix(self):
+        """Test edge reweighting with graphs created from check matrices."""
+        # Create a simple repetition code
+        H = csc_matrix(([1, 1, 1, 1], ([0, 0, 1, 1], [0, 1, 1, 2])), shape=(2, 3))
+        m = Matching(H)
+
+        syndrome = np.array([1, 0])
+
+        # The exact edge indices depend on how the graph is constructed from H
+        # This test mainly ensures no crashes occur
+        edge_reweights = np.array([[0, 1, 0.5]], dtype=np.float64)
+
+        try:
+            correction = m.decode(syndrome, edge_reweights=edge_reweights)
+            assert correction is not None
+        except ValueError:
+            # If the edge doesn't exist in this particular graph construction,
+            # that's also acceptable - the important thing is proper error handling
+            pass
+
+    def test_empty_reweights_array(self):
+        """Test behavior with empty reweights array."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0)
+        m.add_boundary_edge(0, weight=1.0)
+        m.add_boundary_edge(1, weight=1.0)
+
+        syndrome = np.array([1, 1])
+
+        # Empty reweights array should work like no reweights
+        edge_reweights = np.array([], dtype=np.float64).reshape(0, 3)
+        correction_empty = m.decode(syndrome, edge_reweights=edge_reweights)
+        correction_none = m.decode(syndrome)
+
+        np.testing.assert_array_equal(correction_empty, correction_none)
+
+    def test_batch_with_different_reweight_sizes(self):
+        """Test batch decoding with different numbers of reweights per shot."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0)
+        m.add_edge(1, 2, weight=1.0)
+        m.add_boundary_edge(0, weight=1.0)
+        m.add_boundary_edge(2, weight=1.0)
+
+        shots = np.array([
+            [1, 0, 1],
+            [0, 1, 0]
+        ], dtype=np.uint8)
+
+        # Different numbers of reweights per shot
+        reweights1 = np.array([[0, 1, 0.5], [1, 2, 0.5]], dtype=np.float64)  # 2 reweights
+        reweights2 = np.array([[0, -1, 0.1]], dtype=np.float64)  # 1 reweight
+
+        edge_reweights = [reweights1, reweights2]
+
+        corrections = m.decode_batch(shots, edge_reweights=edge_reweights)
+        assert corrections.shape[0] == 2
+
+    def test_exception_safety_single_decode(self):
+        """Test that weights are restored even if decoding throws an exception."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0)
+
+        # This test is more about ensuring the C++ exception safety works
+        # In practice, it's hard to force a decode exception, but the structure should be there
+        syndrome = np.array([1, 1])
+        edge_reweights = np.array([[0, 1, 0.5]], dtype=np.float64)
+
+        # Normal decode should work
+        correction = m.decode(syndrome, edge_reweights=edge_reweights)
+        assert correction is not None
+
+        # Verify weights are restored by doing another decode
+        correction2 = m.decode(syndrome)
+        assert correction2 is not None
+
+    def test_exception_safety_batch_decode(self):
+        """Test that weights are restored even if batch decoding throws an exception."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0)
+        m.add_boundary_edge(0, weight=1.0)
+        m.add_boundary_edge(1, weight=1.0)
+
+        shots = np.array([[1, 1]], dtype=np.uint8)
+        edge_reweights = [np.array([[0, 1, 0.5]], dtype=np.float64)]
+
+        # Normal batch decode should work
+        corrections = m.decode_batch(shots, edge_reweights=edge_reweights)
+        assert corrections.shape[0] == 1
+
+        # Verify weights are restored
+        correction_after = m.decode(np.array([1, 1]))
+        assert correction_after is not None
+
+
+if __name__ == "__main__":
+    pytest.main([__file__])

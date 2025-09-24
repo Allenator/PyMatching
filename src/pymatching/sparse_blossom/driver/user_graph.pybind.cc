@@ -178,25 +178,69 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
     });
     g.def(
         "decode",
-        [](pm::UserGraph &self, const py::array_t<uint64_t> &detection_events, bool enable_correlations) {
-            std::vector<uint64_t> detection_events_vec(
-                detection_events.data(), detection_events.data() + detection_events.size());
+        [](pm::UserGraph &self,
+           const py::array_t<uint64_t> &detection_events,
+           bool enable_correlations,
+           py::object edge_reweights = py::none()) {
             auto &mwpm = enable_correlations ? self.get_mwpm_with_search_graph() : self.get_mwpm();
-            auto obs_crossed = new std::vector<uint8_t>(self.get_num_observables(), 0);
-            pm::total_weight_int weight = 0;
-            pm::decode_detection_events(mwpm, detection_events_vec, obs_crossed->data(), weight, enable_correlations);
-            double rescaled_weight = (double)weight / mwpm.flooder.graph.normalising_constant;
+            bool has_reweights = !edge_reweights.is_none();
+            bool needs_regeneration = false;
 
-            auto err_capsule = py::capsule(obs_crossed, [](void *x) {
-                delete reinterpret_cast<std::vector<uint8_t> *>(x);
-            });
-            py::array_t<uint8_t> obs_crossed_arr =
-                py::array_t<uint8_t>(obs_crossed->size(), obs_crossed->data(), err_capsule);
-            std::pair<py::array_t<std::uint8_t>, double> res = {obs_crossed_arr, rescaled_weight};
-            return res;
+            // Handle edge reweights if provided
+            if (has_reweights) {
+                py::array_t<double> reweights_array = edge_reweights.cast<py::array_t<double>>();
+                auto reweights_unchecked = reweights_array.unchecked<2>();
+                std::vector<std::array<double, 3>> reweight_specs;
+
+                for (py::ssize_t i = 0; i < reweights_unchecked.shape(0); i++) {
+                    reweight_specs.push_back({
+                        reweights_unchecked(i, 0),
+                        reweights_unchecked(i, 1),
+                        reweights_unchecked(i, 2)
+                    });
+                }
+
+                // Determine if regeneration is needed
+                needs_regeneration = self.needs_regeneration(reweight_specs);
+
+                // Get mwpm first, then apply reweights with the mwpm object
+                self.apply_reweights(reweight_specs, mwpm, needs_regeneration);
+                auto &mwpm = enable_correlations ? self.get_mwpm_with_search_graph() : self.get_mwpm();
+            }
+
+            try {
+                // Perform decoding
+                std::vector<uint64_t> detection_events_vec(
+                    detection_events.data(), detection_events.data() + detection_events.size());
+                auto obs_crossed = new std::vector<uint8_t>(self.get_num_observables(), 0);
+                pm::total_weight_int weight = 0;
+                pm::decode_detection_events(mwpm, detection_events_vec, obs_crossed->data(), weight, enable_correlations);
+                double rescaled_weight = (double)weight / mwpm.flooder.graph.normalising_constant;
+
+                // Restore original weights if reweights were applied
+                if (has_reweights) {
+                    self.restore_weights(needs_regeneration);
+                }
+
+                auto err_capsule = py::capsule(obs_crossed, [](void *x) {
+                    delete reinterpret_cast<std::vector<uint8_t> *>(x);
+                });
+                py::array_t<uint8_t> obs_crossed_arr =
+                    py::array_t<uint8_t>(obs_crossed->size(), obs_crossed->data(), err_capsule);
+                std::pair<py::array_t<std::uint8_t>, double> res = {obs_crossed_arr, rescaled_weight};
+                return res;
+
+            } catch (...) {
+                // Ensure weights are restored even on exception
+                if (has_reweights) {
+                    self.restore_weights(needs_regeneration);
+                }
+                throw;
+            }
         },
         "detection_events"_a,
-        "enable_correlations"_a = false);
+        "enable_correlations"_a = false,
+        "edge_reweights"_a = py::none());
     g.def(
         "decode_to_edges_array",
         [](pm::UserGraph &self, const py::array_t<uint64_t> &detection_events, bool enable_correlations) {
@@ -250,7 +294,8 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
            const py::array_t<uint8_t> &shots,
            bool bit_packed_shots,
            bool bit_packed_predictions,
-           bool enable_correlations) {
+           bool enable_correlations,
+           py::object edge_reweights = py::none()) {
             if (shots.ndim() != 2)
                 throw std::invalid_argument(
                     "`shots` array should have two dimensions, not " + std::to_string(shots.ndim()));
@@ -288,56 +333,121 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
             auto &mwpm = enable_correlations ? self.get_mwpm_with_search_graph() : self.get_mwpm();
             std::vector<uint64_t> detection_events;
 
+            // Handle edge reweights if provided - expect list of arrays for per-shot reweights
+            bool has_reweights = !edge_reweights.is_none();
+            bool batch_needs_regeneration = false;
+            std::vector<std::vector<std::array<double, 3>>> all_reweight_specs;
+
+            if (has_reweights) {
+                py::list reweights_list = edge_reweights.cast<py::list>();
+                if (reweights_list.size() != shots.shape(0)) {
+                    throw std::invalid_argument(
+                        "edge_reweights list size (" + std::to_string(reweights_list.size()) +
+                        ") must match number of shots (" + std::to_string(shots.shape(0)) + ")");
+                }
+
+                all_reweight_specs.resize(shots.shape(0));
+
+                // Prepare all reweight specs
+                for (py::ssize_t shot = 0; shot < reweights_list.size(); shot++) {
+                    py::array_t<double> shot_reweights = reweights_list[shot].cast<py::array_t<double>>();
+                    auto reweights_unchecked = shot_reweights.unchecked<2>();
+
+                    for (py::ssize_t j = 0; j < reweights_unchecked.shape(0); j++) {
+                        std::array<double, 3> spec = {
+                            reweights_unchecked(j, 0),
+                            reweights_unchecked(j, 1),
+                            reweights_unchecked(j, 2)
+                        };
+                        all_reweight_specs[shot].push_back(spec);
+                    }
+                }
+
+                // Determine if batch needs regeneration
+                batch_needs_regeneration = self.batch_needs_regeneration(all_reweight_specs);
+            }
+
             // Vector used to extract predicted observables when decoding if bit_packed_predictions is true
             std::vector<uint8_t> temp_predictions;
             if (bit_packed_predictions)
                 temp_predictions.resize(self.get_num_observables());
 
-            // Iterate over the shots, getting detection events and decoding
-            auto s = shots.unchecked<2>();
-            for (py::ssize_t i = 0; i < s.shape(0); i++) {
-                if (bit_packed_shots) {
-                    for (py::ssize_t j = 0; j < s.shape(1); j++) {
-                        size_t bit_offset = j << 3;
-                        for (size_t r = 0; r < 8; r++) {
-                            if (s(i, j) & (1 << r))
-                                detection_events.push_back(bit_offset + r);
+            try {
+                // Iterate over the shots, getting detection events and decoding
+                auto s = shots.unchecked<2>();
+                for (py::ssize_t i = 0; i < s.shape(0); i++) {
+
+                    // Apply per-shot reweights
+                    if (has_reweights && !all_reweight_specs[i].empty()) {
+                        // Regeneration on first shot if needed
+                        bool needs_regeneration = (i == 0 && batch_needs_regeneration);
+                        self.apply_reweights(all_reweight_specs[i], mwpm, needs_regeneration);
+                        auto &mwpm = enable_correlations ? self.get_mwpm_with_search_graph() : self.get_mwpm();
+                    }
+
+                    // Extract detection events for this shot
+                    if (bit_packed_shots) {
+                        for (py::ssize_t j = 0; j < s.shape(1); j++) {
+                            size_t bit_offset = j << 3;
+                            for (size_t r = 0; r < 8; r++) {
+                                if (s(i, j) & (1 << r))
+                                    detection_events.push_back(bit_offset + r);
+                            }
+                        }
+                    } else {
+                        for (py::ssize_t j = 0; j < s.shape(1); j++) {
+                            if (s(i, j))
+                                detection_events.push_back(j);
                         }
                     }
-                } else {
-                    for (py::ssize_t j = 0; j < s.shape(1); j++) {
-                        if (s(i, j))
-                            detection_events.push_back(j);
+
+                    // Decode this shot
+                    pm::total_weight_int solution_weight = 0;
+                    if (bit_packed_predictions) {
+                        std::fill(temp_predictions.begin(), temp_predictions.end(), 0);
+                        pm::decode_detection_events(
+                            mwpm, detection_events, temp_predictions.data(), solution_weight, enable_correlations);
+                        // bitpack the predictions
+                        for (size_t k = 0; k < temp_predictions.size(); k++) {
+                            size_t arr_idx = k >> 3;
+                            *(predictions_ptr + (num_observable_bytes * i) + arr_idx) ^= (temp_predictions[k] << (k % 8));
+                        }
+                    } else {
+                        pm::decode_detection_events(
+                            mwpm,
+                            detection_events,
+                            predictions_ptr + (num_observable_bytes * i),
+                            solution_weight,
+                            enable_correlations);
+                    }
+                    ws(i) = (double)solution_weight / mwpm.flooder.graph.normalising_constant;
+                    detection_events.clear();
+
+                    // Restore weights after this shot
+                    if (has_reweights && !all_reweight_specs[i].empty()) {
+                        // Use batch_needs_regeneration only for the last shot
+                        bool is_last_shot = (i == s.shape(0) - 1);
+                        bool needs_regeneration = is_last_shot ? batch_needs_regeneration : false;
+                        self.restore_weights(needs_regeneration);
                     }
                 }
-                pm::total_weight_int solution_weight = 0;
-                if (bit_packed_predictions) {
-                    std::fill(temp_predictions.begin(), temp_predictions.end(), 0);
-                    pm::decode_detection_events(
-                        mwpm, detection_events, temp_predictions.data(), solution_weight, enable_correlations);
-                    // bitpack the predictions
-                    for (size_t k = 0; k < temp_predictions.size(); k++) {
-                        size_t arr_idx = k >> 3;
-                        *(predictions_ptr + (num_observable_bytes * i) + arr_idx) ^= (temp_predictions[k] << (k % 8));
-                    }
-                } else {
-                    pm::decode_detection_events(
-                        mwpm,
-                        detection_events,
-                        predictions_ptr + (num_observable_bytes * i),
-                        solution_weight,
-                        enable_correlations);
+
+                predictions.resize({(py::ssize_t)shots.shape(0), (py::ssize_t)num_observable_bytes});
+                return py::make_tuple(predictions, weights);
+
+            } catch (...) {
+                // Ensure weights are restored even on exception (pass batch regeneration flag)
+                if (has_reweights) {
+                    self.restore_weights(batch_needs_regeneration);
                 }
-                ws(i) = (double)solution_weight / mwpm.flooder.graph.normalising_constant;
-                detection_events.clear();
+                throw;
             }
-            predictions.resize({(py::ssize_t)shots.shape(0), (py::ssize_t)num_observable_bytes});
-            return py::make_tuple(predictions, weights);
         },
         "shots"_a,
         "bit_packed_shots"_a = false,
         "bit_packed_predictions"_a = false,
-        "enable_correlations"_a = false);
+        "enable_correlations"_a = false,
+        "edge_reweights"_a = py::none());
     g.def(
         "decode_to_matched_detection_events_dict",
         [](pm::UserGraph &self, const py::array_t<uint64_t> &detection_events) {

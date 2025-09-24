@@ -220,6 +220,7 @@ class Matching:
                *,
                return_weight: bool = False,
                enable_correlations: bool = False,
+               edge_reweights: np.ndarray = None,
                **kwargs
                ) -> Union[np.ndarray, Tuple[np.ndarray, int]]:
         r"""
@@ -338,7 +339,7 @@ class Matching:
         """
         detection_events = self._syndrome_array_to_detection_events(z)
         correction, weight = self._matching_graph.decode(
-            detection_events, enable_correlations=enable_correlations
+            detection_events, enable_correlations=enable_correlations, edge_reweights=edge_reweights
         )
         if return_weight:
             return correction, weight
@@ -352,7 +353,8 @@ class Matching:
             return_weights: bool = False,
             bit_packed_shots: bool = False,
             bit_packed_predictions: bool = False,
-            enable_correlations: bool = False) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+            enable_correlations: bool = False,
+            edge_reweights: List[np.ndarray] = None) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         """
         Decode from a 2D `shots` array containing a batch of syndrome measurements. A faster
         alternative to using `pymatching.Matching.decode` and iterating over the shots in Python.
@@ -452,7 +454,8 @@ class Matching:
             shots,
             bit_packed_predictions=bit_packed_predictions,
             bit_packed_shots=bit_packed_shots,
-            enable_correlations=enable_correlations
+            enable_correlations=enable_correlations,
+            edge_reweights=edge_reweights
         )
         if return_weights:
             return predictions, weights

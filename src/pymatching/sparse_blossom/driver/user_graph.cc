@@ -506,6 +506,262 @@ pm::UserGraph pm::detector_error_model_to_user_graph(
     return user_graph;
 }
 
+void pm::UserGraph::apply_reweights(const std::vector<std::array<double, 3>>& reweight_specs, pm::Mwpm& mwpm, bool needs_regeneration) {
+    // Check graph has no negative weights
+    if (!mwpm.flooder.negative_weight_detection_events.empty()) {
+        throw std::invalid_argument("Edge reweighting not supported with negative edge weights");
+    }
+
+    // Validate and prepare reweights
+    std::vector<EdgeReweight> prepared_reweights;
+    for (const auto& spec : reweight_specs) {
+        size_t node1 = (size_t)spec[0];
+        double node2_raw = spec[1];
+        size_t node2;
+
+        // Validate boundary edge format first
+        if (node2_raw < 0) {
+            if (node2_raw != -1.0) {
+                throw std::invalid_argument("Boundary edges must use exactly -1 as second node");
+            }
+            node2 = SIZE_MAX;
+        } else {
+            node2 = (size_t)node2_raw;
+        }
+
+        double new_weight = spec[2];
+
+        // Validate new weight is non-negative
+        if (new_weight < 0) {
+            throw std::invalid_argument("Reweight values must be non-negative");
+        }
+
+        // Find existing edge and store original weight
+        double original_weight;
+        if (!get_edge_or_boundary_edge_weight(node1, node2, original_weight)) {
+            std::string node2_str = (node2 == SIZE_MAX) ? "-1" : std::to_string(node2);
+            throw std::invalid_argument("Edge (" + std::to_string(node1) + ", " +
+                                      node2_str + ") does not exist");
+        }
+
+        EdgeReweight reweight;
+        reweight.node1 = node1;
+        reweight.node2 = node2;
+        reweight.original_weight = original_weight;
+        reweight.new_weight = new_weight;
+
+        // Initialize neighbor indices (will be populated if needed)
+        reweight.matching_graph_node1_neighbor_idx = SIZE_MAX;
+        reweight.matching_graph_node2_neighbor_idx = SIZE_MAX;
+        reweight.search_graph_node1_neighbor_idx = SIZE_MAX;
+        reweight.search_graph_node2_neighbor_idx = SIZE_MAX;
+        reweight.original_normalized_weight = 0;
+        reweight.new_normalized_weight = 0;
+
+        prepared_reweights.push_back(reweight);
+    }
+
+    // Apply the reweights
+    _active_reweights = prepared_reweights;
+
+    // Apply weights to UserGraph edges
+    for (const auto& rw : prepared_reweights) {
+        size_t neighbor_idx = nodes[rw.node1].index_of_neighbor(rw.node2);
+        nodes[rw.node1].neighbors[neighbor_idx].edge_it->weight = rw.new_weight;
+    }
+
+    if (needs_regeneration) {
+        // Full regeneration
+        _mwpm_needs_updating = true;
+    } else {
+        // Direct graph weight updates
+        // Calculate normalized weights using the mwpm's normalization constant
+        for (auto& rw : _active_reweights) {
+            rw.original_normalized_weight = (weight_int)round(rw.original_weight * mwpm.flooder.graph.normalising_constant) * 2;
+            rw.new_normalized_weight = (weight_int)round(rw.new_weight * mwpm.flooder.graph.normalising_constant) * 2;
+        }
+
+        // Update weights directly in existing graphs
+        update_existing_graph_weights();
+
+        // DO NOT set _mwpm_needs_updating = true
+    }
+}
+
+void pm::UserGraph::restore_weights(bool needs_regeneration) {
+    if (_active_reweights.empty()) return;
+
+    // Restore UserGraph weights
+    for (const auto& rw : _active_reweights) {
+        size_t neighbor_idx = nodes[rw.node1].index_of_neighbor(rw.node2);
+        nodes[rw.node1].neighbors[neighbor_idx].edge_it->weight = rw.original_weight;
+    }
+
+    if (needs_regeneration) {
+        // Trigger regeneration to restore original normalization
+        _mwpm_needs_updating = true;
+    } else {
+        // Restore weights directly in existing graphs
+        // Restore MatchingGraph weights
+        if (_mwpm.flooder.graph.nodes.size() > 0) {
+            for (const auto& rw : _active_reweights) {
+                if (rw.matching_graph_node1_neighbor_idx != SIZE_MAX) {
+                    _mwpm.flooder.graph.nodes[rw.node1].neighbor_weights[rw.matching_graph_node1_neighbor_idx] =
+                        rw.original_normalized_weight;
+                }
+                if (rw.node2 != SIZE_MAX && rw.matching_graph_node2_neighbor_idx != SIZE_MAX) {
+                    _mwpm.flooder.graph.nodes[rw.node2].neighbor_weights[rw.matching_graph_node2_neighbor_idx] =
+                        rw.original_normalized_weight;
+                }
+            }
+        }
+
+        // Restore SearchGraph weights
+        if (_mwpm.search_flooder.graph.nodes.size() > 0) {
+            for (const auto& rw : _active_reweights) {
+                if (rw.search_graph_node1_neighbor_idx != SIZE_MAX) {
+                    _mwpm.search_flooder.graph.nodes[rw.node1].neighbor_weights[rw.search_graph_node1_neighbor_idx] =
+                        rw.original_normalized_weight;
+                }
+                if (rw.node2 != SIZE_MAX && rw.search_graph_node2_neighbor_idx != SIZE_MAX) {
+                    _mwpm.search_flooder.graph.nodes[rw.node2].neighbor_weights[rw.search_graph_node2_neighbor_idx] =
+                        rw.original_normalized_weight;
+                }
+            }
+        }
+
+        // DO NOT set _mwpm_needs_updating = true
+    }
+
+    // Reset state
+    _active_reweights.clear();
+}
+
+bool pm::UserGraph::needs_regeneration(const std::vector<std::array<double, 3>>& reweight_specs) {
+    double original_max_abs_weight = max_abs_weight();
+    double max_abs_weight = original_max_abs_weight;
+
+    // Find maximum weight among the reweight specifications
+    for (const auto& spec : reweight_specs) {
+        double new_weight = spec[2];
+        max_abs_weight = std::max(max_abs_weight, std::abs(new_weight));
+    }
+
+    return max_abs_weight > original_max_abs_weight;
+}
+
+bool pm::UserGraph::batch_needs_regeneration(const std::vector<std::vector<std::array<double, 3>>>& all_reweight_specs) {
+    double original_max_abs_weight = max_abs_weight();
+    double global_max_abs_weight = original_max_abs_weight;
+
+    // Find global maximum weight across all shots
+    for (const auto& shot_reweights : all_reweight_specs) {
+        for (const auto& spec : shot_reweights) {
+            double new_weight = spec[2];
+            global_max_abs_weight = std::max(global_max_abs_weight, std::abs(new_weight));
+        }
+    }
+
+    return global_max_abs_weight > original_max_abs_weight;
+}
+
+void pm::UserGraph::update_existing_graph_weights() {
+    // Update MatchingGraph weights
+    if (_mwpm.flooder.graph.nodes.size() > 0) {
+        for (auto& rw : _active_reweights) {
+            // Find neighbor indices if not already found
+            if (rw.matching_graph_node1_neighbor_idx == SIZE_MAX) {
+                rw.matching_graph_node1_neighbor_idx = find_neighbor_index_in_matching_graph(rw.node1, rw.node2);
+            }
+            if (rw.node2 != SIZE_MAX && rw.matching_graph_node2_neighbor_idx == SIZE_MAX) {
+                rw.matching_graph_node2_neighbor_idx = find_neighbor_index_in_matching_graph(rw.node2, rw.node1);
+            }
+
+            // Update forward edge (node1 -> node2)
+            if (rw.matching_graph_node1_neighbor_idx != SIZE_MAX) {
+                _mwpm.flooder.graph.nodes[rw.node1].neighbor_weights[rw.matching_graph_node1_neighbor_idx] =
+                    rw.new_normalized_weight;
+            }
+
+            // Update reverse edge (node2 -> node1) if not boundary edge
+            if (rw.node2 != SIZE_MAX && rw.matching_graph_node2_neighbor_idx != SIZE_MAX) {
+                _mwpm.flooder.graph.nodes[rw.node2].neighbor_weights[rw.matching_graph_node2_neighbor_idx] =
+                    rw.new_normalized_weight;
+            }
+        }
+    }
+
+    // Update SearchGraph weights (if it exists)
+    if (_mwpm.search_flooder.graph.nodes.size() > 0) {
+        for (auto& rw : _active_reweights) {
+            // Find neighbor indices if not already found
+            if (rw.search_graph_node1_neighbor_idx == SIZE_MAX) {
+                rw.search_graph_node1_neighbor_idx = find_neighbor_index_in_search_graph(rw.node1, rw.node2);
+            }
+            if (rw.node2 != SIZE_MAX && rw.search_graph_node2_neighbor_idx == SIZE_MAX) {
+                rw.search_graph_node2_neighbor_idx = find_neighbor_index_in_search_graph(rw.node2, rw.node1);
+            }
+
+            // Update forward edge (node1 -> node2)
+            if (rw.search_graph_node1_neighbor_idx != SIZE_MAX) {
+                _mwpm.search_flooder.graph.nodes[rw.node1].neighbor_weights[rw.search_graph_node1_neighbor_idx] =
+                    rw.new_normalized_weight;
+            }
+
+            // Update reverse edge (node2 -> node1) if not boundary edge
+            if (rw.node2 != SIZE_MAX && rw.search_graph_node2_neighbor_idx != SIZE_MAX) {
+                _mwpm.search_flooder.graph.nodes[rw.node2].neighbor_weights[rw.search_graph_node2_neighbor_idx] =
+                    rw.new_normalized_weight;
+            }
+        }
+    }
+}
+
+size_t pm::UserGraph::find_neighbor_index_in_matching_graph(size_t node1, size_t node2) {
+    if (node1 >= _mwpm.flooder.graph.nodes.size()) {
+        return SIZE_MAX;
+    }
+
+    const auto& neighbors = _mwpm.flooder.graph.nodes[node1].neighbors;
+    for (size_t i = 0; i < neighbors.size(); i++) {
+        if (node2 == SIZE_MAX) {
+            // Looking for boundary edge
+            if (neighbors[i] == nullptr) {
+                return i;
+            }
+        } else {
+            // Looking for regular edge
+            if (neighbors[i] != nullptr && (neighbors[i] - &_mwpm.flooder.graph.nodes[0]) == node2) {
+                return i;
+            }
+        }
+    }
+    return SIZE_MAX;
+}
+
+size_t pm::UserGraph::find_neighbor_index_in_search_graph(size_t node1, size_t node2) {
+    if (node1 >= _mwpm.search_flooder.graph.nodes.size()) {
+        return SIZE_MAX;
+    }
+
+    const auto& neighbors = _mwpm.search_flooder.graph.nodes[node1].neighbors;
+    for (size_t i = 0; i < neighbors.size(); i++) {
+        if (node2 == SIZE_MAX) {
+            // Looking for boundary edge
+            if (neighbors[i] == nullptr) {
+                return i;
+            }
+        } else {
+            // Looking for regular edge
+            if (neighbors[i] != nullptr && (neighbors[i] - &_mwpm.search_flooder.graph.nodes[0]) == node2) {
+                return i;
+            }
+        }
+    }
+    return SIZE_MAX;
+}
+
+
 void pm::UserGraph::populate_implied_edge_weights(
     std::map<std::pair<size_t, size_t>, std::map<std::pair<size_t, size_t>, double>>& joint_probabilites) {
     for (auto& edge : edges) {

@@ -41,6 +41,21 @@ struct UserEdge {
     std::vector<ImpliedWeightUnconverted> implied_weights_for_other_edges;
 };
 
+struct EdgeReweight {
+    size_t node1;
+    size_t node2;  // SIZE_MAX for boundary edges
+    double original_weight;
+    double new_weight;
+
+    // Tier 1 optimization fields for direct graph updates
+    size_t matching_graph_node1_neighbor_idx;
+    size_t matching_graph_node2_neighbor_idx;  // SIZE_MAX if boundary edge
+    size_t search_graph_node1_neighbor_idx;
+    size_t search_graph_node2_neighbor_idx;    // SIZE_MAX if boundary edge
+    weight_int original_normalized_weight;
+    weight_int new_normalized_weight;
+};
+
 struct UserNeighbor {
     std::list<UserEdge>::iterator edge_it;
     uint8_t pos{};  // The position of the neighboring node in the edge (either 0 if node1, or 1 if node2)
@@ -124,11 +139,25 @@ class UserGraph {
     void populate_implied_edge_weights(
         std::map<std::pair<size_t, size_t>, std::map<std::pair<size_t, size_t>, double>>& joint_probabilites);
 
+    // Edge reweighting methods
+    void apply_reweights(const std::vector<std::array<double, 3>>& reweight_specs, pm::Mwpm& mwpm, bool needs_regeneration = false);
+    void restore_weights(bool needs_regeneration = false);
+    bool needs_regeneration(const std::vector<std::array<double, 3>>& reweight_specs);
+    bool batch_needs_regeneration(const std::vector<std::vector<std::array<double, 3>>>& all_reweight_specs);
+
    private:
     pm::Mwpm _mwpm;
     size_t _num_observables;
     bool _mwpm_needs_updating;
     bool _all_edges_have_error_probabilities;
+
+    // Reweighting state
+    std::vector<EdgeReweight> _active_reweights;
+
+    // Internal reweighting helper methods
+    void update_existing_graph_weights();
+    size_t find_neighbor_index_in_matching_graph(size_t node1, size_t node2);
+    size_t find_neighbor_index_in_search_graph(size_t node1, size_t node2);
 };
 
 template <typename EdgeCallable, typename BoundaryEdgeCallable>
