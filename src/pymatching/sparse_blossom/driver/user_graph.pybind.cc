@@ -350,7 +350,15 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
 
                 // Prepare all reweight specs
                 for (py::ssize_t shot = 0; shot < reweights_list.size(); shot++) {
-                    py::array_t<double> shot_reweights = reweights_list[shot].cast<py::array_t<double>>();
+                    py::object shot_reweights_obj = reweights_list[shot];
+
+                    // Handle None values - skip shots without reweights
+                    if (shot_reweights_obj.is_none()) {
+                        // Leave all_reweight_specs[shot] empty (already initialized as empty vector)
+                        continue;
+                    }
+
+                    py::array_t<double> shot_reweights = shot_reweights_obj.cast<py::array_t<double>>();
                     auto reweights_unchecked = shot_reweights.unchecked<2>();
 
                     for (py::ssize_t j = 0; j < reweights_unchecked.shape(0); j++) {
