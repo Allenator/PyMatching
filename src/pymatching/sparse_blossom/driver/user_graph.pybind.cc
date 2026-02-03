@@ -295,7 +295,8 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
            bool bit_packed_shots,
            bool bit_packed_predictions,
            bool enable_correlations,
-           py::object edge_reweights = py::none()) {
+           py::object edge_reweights = py::none(),
+           size_t reweight_stride = 1) {
             if (shots.ndim() != 2)
                 throw std::invalid_argument(
                     "`shots` array should have two dimensions, not " + std::to_string(shots.ndim()));
@@ -333,33 +334,46 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
             auto &mwpm = enable_correlations ? self.get_mwpm_with_search_graph() : self.get_mwpm();
             std::vector<uint64_t> detection_events;
 
-            // Handle edge reweights if provided - expect list of arrays for per-shot reweights
+            // Handle edge reweights if provided - expect list of arrays for reweight rules
             bool has_reweights = !edge_reweights.is_none();
             bool batch_needs_regeneration = false;
             std::vector<std::vector<std::array<double, 3>>> all_reweight_specs;
 
             if (has_reweights) {
-                py::list reweights_list = edge_reweights.cast<py::list>();
-                if (reweights_list.size() != shots.shape(0)) {
+                // Validate stride parameter
+                if (reweight_stride < 1) {
                     throw std::invalid_argument(
-                        "edge_reweights list size (" + std::to_string(reweights_list.size()) +
-                        ") must match number of shots (" + std::to_string(shots.shape(0)) + ")");
+                        "reweight_stride must be a positive integer, got " + std::to_string(reweight_stride));
                 }
 
-                all_reweight_specs.resize(shots.shape(0));
+                py::list reweights_list = edge_reweights.cast<py::list>();
+                size_t num_rules = reweights_list.size();
+                size_t num_shots = shots.shape(0);
 
-                // Prepare all reweight specs
-                for (py::ssize_t shot = 0; shot < reweights_list.size(); shot++) {
-                    py::object shot_reweights_obj = reweights_list[shot];
+                // Validate stride × num_rules == num_shots
+                if (reweight_stride * num_rules != num_shots) {
+                    throw std::invalid_argument(
+                        "reweight_stride (" + std::to_string(reweight_stride) +
+                        ") × number of reweight rules (" + std::to_string(num_rules) +
+                        ") = " + std::to_string(reweight_stride * num_rules) +
+                        ", but number of shots is " + std::to_string(num_shots) +
+                        ". These must be equal.");
+                }
 
-                    // Handle None values - skip shots without reweights
-                    if (shot_reweights_obj.is_none()) {
-                        // Leave all_reweight_specs[shot] empty (already initialized as empty vector)
+                all_reweight_specs.resize(num_rules);
+
+                // Prepare all reweight specs (one per rule, not per shot)
+                for (py::ssize_t rule = 0; rule < reweights_list.size(); rule++) {
+                    py::object rule_reweights_obj = reweights_list[rule];
+
+                    // Handle None values - skip rules without reweights
+                    if (rule_reweights_obj.is_none()) {
+                        // Leave all_reweight_specs[rule] empty (already initialized as empty vector)
                         continue;
                     }
 
-                    py::array_t<double> shot_reweights = shot_reweights_obj.cast<py::array_t<double>>();
-                    auto reweights_unchecked = shot_reweights.unchecked<2>();
+                    py::array_t<double> rule_reweights = rule_reweights_obj.cast<py::array_t<double>>();
+                    auto reweights_unchecked = rule_reweights.unchecked<2>();
 
                     for (py::ssize_t j = 0; j < reweights_unchecked.shape(0); j++) {
                         std::array<double, 3> spec = {
@@ -367,7 +381,7 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                             reweights_unchecked(j, 1),
                             reweights_unchecked(j, 2)
                         };
-                        all_reweight_specs[shot].push_back(spec);
+                        all_reweight_specs[rule].push_back(spec);
                     }
                 }
 
@@ -385,11 +399,16 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                 auto s = shots.unchecked<2>();
                 for (py::ssize_t i = 0; i < s.shape(0); i++) {
 
-                    // Apply per-shot reweights
-                    if (has_reweights && !all_reweight_specs[i].empty()) {
-                        // Regeneration on first shot if needed
-                        bool needs_regeneration = (i == 0 && batch_needs_regeneration);
-                        self.apply_reweights(all_reweight_specs[i], mwpm, needs_regeneration);
+                    // Calculate which rule applies to this shot (stride-based)
+                    size_t rule_idx = has_reweights ? (i / reweight_stride) : 0;
+                    bool is_first_shot_in_block = (i % reweight_stride == 0);
+                    bool is_last_shot_in_block = ((i + 1) % reweight_stride == 0) || (i == s.shape(0) - 1);
+
+                    // Apply reweights only at the start of each block
+                    if (has_reweights && is_first_shot_in_block && !all_reweight_specs[rule_idx].empty()) {
+                        // Regeneration on first rule if needed
+                        bool needs_regeneration = (rule_idx == 0 && batch_needs_regeneration);
+                        self.apply_reweights(all_reweight_specs[rule_idx], mwpm, needs_regeneration);
                         auto &mwpm = enable_correlations ? self.get_mwpm_with_search_graph() : self.get_mwpm();
                     }
 
@@ -431,11 +450,11 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                     ws(i) = (double)solution_weight / mwpm.flooder.graph.normalising_constant;
                     detection_events.clear();
 
-                    // Restore weights after this shot
-                    if (has_reweights && !all_reweight_specs[i].empty()) {
-                        // Use batch_needs_regeneration only for the last shot
-                        bool is_last_shot = (i == s.shape(0) - 1);
-                        bool needs_regeneration = is_last_shot ? batch_needs_regeneration : false;
+                    // Restore weights only at the end of each block
+                    if (has_reweights && is_last_shot_in_block && !all_reweight_specs[rule_idx].empty()) {
+                        // Use batch_needs_regeneration only for the last rule
+                        bool is_last_rule = (rule_idx == all_reweight_specs.size() - 1);
+                        bool needs_regeneration = is_last_rule ? batch_needs_regeneration : false;
                         self.restore_weights(needs_regeneration);
                     }
                 }
@@ -455,7 +474,8 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
         "bit_packed_shots"_a = false,
         "bit_packed_predictions"_a = false,
         "enable_correlations"_a = false,
-        "edge_reweights"_a = py::none());
+        "edge_reweights"_a = py::none(),
+        "reweight_stride"_a = 1);
     g.def(
         "decode_to_matched_detection_events_dict",
         [](pm::UserGraph &self, const py::array_t<uint64_t> &detection_events) {

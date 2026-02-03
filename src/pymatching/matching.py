@@ -354,7 +354,8 @@ class Matching:
             bit_packed_shots: bool = False,
             bit_packed_predictions: bool = False,
             enable_correlations: bool = False,
-            edge_reweights: List[np.ndarray] = None) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+            edge_reweights: List[np.ndarray] = None,
+            reweight_stride: int = 1) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         """
         Decode from a 2D `shots` array containing a batch of syndrome measurements. A faster
         alternative to using `pymatching.Matching.decode` and iterating over the shots in Python.
@@ -398,6 +399,29 @@ class Matching:
             `stim.DetectorErrorModel` with `enable_correlations=True`. For a description
             of the correlated matching algorithm, see https://arxiv.org/abs/1310.0863.
             By default, False
+        edge_reweights : List[np.ndarray], optional
+            A list of edge reweight arrays, one per reweight rule. Each array should have
+            shape (num_reweights, 3) with dtype=np.float64, where each row is [node1, node2, weight].
+            Use -1 for node2 to specify boundary edges.
+
+            When reweight_stride=1 (default), there must be one reweight array per shot.
+            When reweight_stride>1, each reweight rule applies to `reweight_stride` consecutive
+            shots, so len(edge_reweights) × reweight_stride must equal the number of shots.
+
+            Use None for rules that don't modify any weights. By default, None.
+        reweight_stride : int, optional
+            The number of consecutive shots each reweight rule applies to. Default is 1,
+            meaning each rule applies to exactly one shot (backward compatible behavior).
+
+            When stride > 1, reweight rules are applied in consecutive blocks:
+            - Rule 0 applies to shots [0, stride)
+            - Rule 1 applies to shots [stride, 2*stride)
+            - Rule k applies to shots [k*stride, (k+1)*stride)
+
+            Constraint: stride × len(edge_reweights) must equal the number of shots.
+
+            This reduces memory overhead and apply/restore cycles when the same reweighting
+            applies to multiple consecutive shots.
 
         Returns
         -------
@@ -449,13 +473,28 @@ class Matching:
         >>> predicted_observables.shape
         (10000, 1)
         >>> num_errors = np.sum(np.any(predicted_observables != actual_observables, axis=1))
+
+        Using reweight_stride to apply the same reweighting to multiple consecutive shots:
+        >>> import pymatching
+        >>> import numpy as np
+        >>> m = pymatching.Matching()
+        >>> m.add_edge(0, 1, weight=1.0)
+        >>> m.add_boundary_edge(0, weight=1.0)
+        >>> m.add_boundary_edge(1, weight=1.0)
+        >>> shots = np.array([[1, 0], [0, 1], [1, 1], [1, 0]], dtype=np.uint8)  # 4 shots
+        >>> reweights = [
+        ...     np.array([[0, 1, 0.5]], dtype=np.float64),  # Applies to shots 0-1
+        ...     np.array([[0, 1, 2.0]], dtype=np.float64),  # Applies to shots 2-3
+        ... ]
+        >>> predictions = m.decode_batch(shots, edge_reweights=reweights, reweight_stride=2)
         """
         predictions, weights = self._matching_graph.decode_batch(
             shots,
             bit_packed_predictions=bit_packed_predictions,
             bit_packed_shots=bit_packed_shots,
             enable_correlations=enable_correlations,
-            edge_reweights=edge_reweights
+            edge_reweights=edge_reweights,
+            reweight_stride=reweight_stride
         )
         if return_weights:
             return predictions, weights

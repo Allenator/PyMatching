@@ -339,6 +339,154 @@ class TestEdgeReweighting:
         correction_after = m.decode(np.array([1, 1]))
         assert correction_after is not None
 
+    def test_batch_decoding_with_stride(self):
+        """Test batch decoding with stride > 1."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0)
+        m.add_edge(1, 2, weight=1.0)
+        m.add_boundary_edge(0, weight=1.0)
+        m.add_boundary_edge(2, weight=1.0)
+
+        # 6 shots, 2 rules, stride=3
+        shots = np.array([
+            [1, 0, 1],
+            [0, 1, 0],
+            [1, 1, 0],
+            [1, 0, 1],
+            [0, 1, 0],
+            [1, 1, 0]
+        ], dtype=np.uint8)
+
+        reweights1 = np.array([[0, 1, 0.1]], dtype=np.float64)  # Shots 0-2
+        reweights2 = np.array([[1, 2, 0.1]], dtype=np.float64)  # Shots 3-5
+
+        corrections = m.decode_batch(
+            shots,
+            edge_reweights=[reweights1, reweights2],
+            reweight_stride=3
+        )
+
+        assert corrections.shape[0] == 6
+
+    def test_stride_one_backward_compatible(self):
+        """Test that stride=1 behaves identically to current implementation."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0)
+        m.add_boundary_edge(0, weight=1.0)
+        m.add_boundary_edge(1, weight=1.0)
+
+        shots = np.array([[1, 0], [0, 1]], dtype=np.uint8)
+        reweights = [
+            np.array([[0, 1, 0.5]], dtype=np.float64),
+            np.array([[0, 1, 0.5]], dtype=np.float64)
+        ]
+
+        # Explicit stride=1
+        result1 = m.decode_batch(shots, edge_reweights=reweights, reweight_stride=1)
+
+        # Default stride (should be 1)
+        result2 = m.decode_batch(shots, edge_reweights=reweights)
+
+        np.testing.assert_array_equal(result1, result2)
+
+    def test_invalid_stride_zero(self):
+        """Test that stride=0 raises an error."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0)
+        m.add_boundary_edge(0, weight=1.0)
+        m.add_boundary_edge(1, weight=1.0)
+
+        shots = np.array([[1, 1]], dtype=np.uint8)
+        reweights = [np.array([[0, 1, 0.5]], dtype=np.float64)]
+
+        with pytest.raises(ValueError, match="positive integer"):
+            m.decode_batch(shots, edge_reweights=reweights, reweight_stride=0)
+
+    def test_stride_mismatch(self):
+        """Test that stride × rules != shots raises an error."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0)
+        m.add_boundary_edge(0, weight=1.0)
+        m.add_boundary_edge(1, weight=1.0)
+
+        shots = np.array([[1, 0], [0, 1], [1, 1]], dtype=np.uint8)  # 3 shots
+        reweights = [np.array([[0, 1, 0.5]], dtype=np.float64)]  # 1 rule
+
+        with pytest.raises(ValueError, match="must be equal"):
+            m.decode_batch(shots, edge_reweights=reweights, reweight_stride=2)  # 2 × 1 = 2 ≠ 3
+
+    def test_stride_with_none_rules(self):
+        """Test stride with some None rules (no reweighting for those blocks)."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0)
+        m.add_boundary_edge(0, weight=1.0)
+        m.add_boundary_edge(1, weight=1.0)
+
+        shots = np.array([
+            [1, 0], [0, 1],  # Block 0: reweighted
+            [1, 1], [1, 0],  # Block 1: no reweighting
+        ], dtype=np.uint8)
+
+        reweights = [
+            np.array([[0, 1, 0.5]], dtype=np.float64),  # Block 0
+            None,  # Block 1: no reweighting
+        ]
+
+        corrections = m.decode_batch(
+            shots,
+            edge_reweights=reweights,
+            reweight_stride=2
+        )
+
+        assert corrections.shape[0] == 4
+
+    def test_stride_with_regeneration(self):
+        """Test stride mode when regeneration is needed."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0)  # Max weight is 1.0
+        m.add_boundary_edge(0, weight=0.5)
+        m.add_boundary_edge(1, weight=0.5)
+
+        shots = np.array([
+            [1, 0], [0, 1],
+            [1, 1], [1, 0],
+        ], dtype=np.uint8)
+
+        # Weight 5.0 > max weight 1.0, triggers regeneration
+        reweights = [
+            np.array([[0, 1, 5.0]], dtype=np.float64),
+            np.array([[0, 1, 0.5]], dtype=np.float64),
+        ]
+
+        corrections = m.decode_batch(
+            shots,
+            edge_reweights=reweights,
+            reweight_stride=2
+        )
+
+        assert corrections.shape[0] == 4
+
+    def test_stride_weight_restoration(self):
+        """Test that weights are properly restored after stride-based decoding."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0)
+        m.add_boundary_edge(0, weight=1.0)
+        m.add_boundary_edge(1, weight=1.0)
+
+        syndrome = np.array([1, 1])
+
+        # Get original result
+        original = m.decode(syndrome)
+
+        # Decode batch with stride
+        shots = np.array([[1, 0], [0, 1]], dtype=np.uint8)
+        reweights = [np.array([[0, 1, 10.0]], dtype=np.float64)]
+        m.decode_batch(shots, edge_reweights=reweights, reweight_stride=2)
+
+        # Verify weights are restored
+        restored = m.decode(syndrome)
+        np.testing.assert_array_equal(original, restored)
+
 
 if __name__ == "__main__":
     pytest.main([__file__])
