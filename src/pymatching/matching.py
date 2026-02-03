@@ -921,6 +921,13 @@ class Matching:
         set to 1.0 if not specified), and `error_probability`
         (the error probability of the edge, set to -1 if not specified).
 
+        .. note::
+            For performance optimization, when using ``edge_reweights`` with ``decode()`` or
+            ``decode_batch()`` in Tier 1 mode (when reweight values don't exceed the original
+            maximum weight), this method returns the **original** edge weights, not the
+            temporarily reweighted values. The reweighted values are only applied to the
+            internal matching graph structures used for decoding.
+
         Returns
         -------
         List of (int, int, dict) tuples
