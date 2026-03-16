@@ -355,7 +355,8 @@ class Matching:
             bit_packed_predictions: bool = False,
             enable_correlations: bool = False,
             edge_reweights: List[np.ndarray] = None,
-            reweight_stride: int = 1) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+            reweight_stride: int = 1,
+            logical_error_if_no_matching: bool = False) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         """
         Decode from a 2D `shots` array containing a batch of syndrome measurements. A faster
         alternative to using `pymatching.Matching.decode` and iterating over the shots in Python.
@@ -422,6 +423,11 @@ class Matching:
 
             This reduces memory overhead and apply/restore cycles when the same reweighting
             applies to multiple consecutive shots.
+        logical_error_if_no_matching : bool, optional
+            If True, shots where no perfect matching can be found (e.g. due to odd parity
+            in a connected component without a boundary) will have all observable prediction
+            bits set to 1 instead of raising an exception. This effectively forces those shots
+            to be counted as logical errors. By default, False.
 
         Returns
         -------
@@ -494,7 +500,8 @@ class Matching:
             bit_packed_shots=bit_packed_shots,
             enable_correlations=enable_correlations,
             edge_reweights=edge_reweights,
-            reweight_stride=reweight_stride
+            reweight_stride=reweight_stride,
+            logical_error_if_no_matching=logical_error_if_no_matching
         )
         if return_weights:
             return predictions, weights

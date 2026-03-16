@@ -296,7 +296,8 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
            bool bit_packed_predictions,
            bool enable_correlations,
            py::object edge_reweights = py::none(),
-           size_t reweight_stride = 1) {
+           size_t reweight_stride = 1,
+           bool logical_error_if_no_matching = false) {
             if (shots.ndim() != 2)
                 throw std::invalid_argument(
                     "`shots` array should have two dimensions, not " + std::to_string(shots.ndim()));
@@ -430,24 +431,33 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
 
                     // Decode this shot
                     pm::total_weight_int solution_weight = 0;
-                    if (bit_packed_predictions) {
-                        std::fill(temp_predictions.begin(), temp_predictions.end(), 0);
-                        pm::decode_detection_events(
-                            mwpm, detection_events, temp_predictions.data(), solution_weight, enable_correlations);
-                        // bitpack the predictions
-                        for (size_t k = 0; k < temp_predictions.size(); k++) {
-                            size_t arr_idx = k >> 3;
-                            *(predictions_ptr + (num_observable_bytes * i) + arr_idx) ^= (temp_predictions[k] << (k % 8));
+                    try {
+                        if (bit_packed_predictions) {
+                            std::fill(temp_predictions.begin(), temp_predictions.end(), 0);
+                            pm::decode_detection_events(
+                                mwpm, detection_events, temp_predictions.data(), solution_weight, enable_correlations);
+                            // bitpack the predictions
+                            for (size_t k = 0; k < temp_predictions.size(); k++) {
+                                size_t arr_idx = k >> 3;
+                                *(predictions_ptr + (num_observable_bytes * i) + arr_idx) ^= (temp_predictions[k] << (k % 8));
+                            }
+                        } else {
+                            pm::decode_detection_events(
+                                mwpm,
+                                detection_events,
+                                predictions_ptr + (num_observable_bytes * i),
+                                solution_weight,
+                                enable_correlations);
                         }
-                    } else {
-                        pm::decode_detection_events(
-                            mwpm,
-                            detection_events,
-                            predictions_ptr + (num_observable_bytes * i),
-                            solution_weight,
-                            enable_correlations);
+                        ws(i) = (double)solution_weight / mwpm.flooder.graph.normalising_constant;
+                    } catch (const std::invalid_argument&) {
+                        if (!logical_error_if_no_matching) throw;
+                        // No perfect matching found — force logical error by setting all
+                        // observable prediction bits to 1. XOR with actual observable flips
+                        // will be nonzero (the unused high bits guarantee this).
+                        memset(predictions_ptr + (num_observable_bytes * i), 0xFF, num_observable_bytes);
+                        ws(i) = 0.0;
                     }
-                    ws(i) = (double)solution_weight / mwpm.flooder.graph.normalising_constant;
                     detection_events.clear();
 
                     // Restore weights only at the end of each block
@@ -475,7 +485,8 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
         "bit_packed_predictions"_a = false,
         "enable_correlations"_a = false,
         "edge_reweights"_a = py::none(),
-        "reweight_stride"_a = 1);
+        "reweight_stride"_a = 1,
+        "logical_error_if_no_matching"_a = false);
     g.def(
         "decode_to_matched_detection_events_dict",
         [](pm::UserGraph &self, const py::array_t<uint64_t> &detection_events) {
